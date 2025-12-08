@@ -142,9 +142,8 @@ def generate_localized_output(df, instruction_lang_code, output_ratio_cols=['ROA
         
     return results
 
-# Example Usage
-# final_summary = generate_localized_output(df_processed, instruction_lang)
-# print(final_summary)
 
+# Clean data and define constraints
+# first, we will do a descriptive analyse, so, we won't apply panel data constraints, just, financial constraints.
 
-
+# Missing values
