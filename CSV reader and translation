@@ -1,0 +1,150 @@
+pip install pandas
+import pandas as pd
+import os
+
+# STEP 1: Load CSV and isolate column headers
+
+def load_data(file_path):
+    """Loads the CSV file into a DataFrame."""
+    try:
+        # Load the data - ensure to adjust separator (sep) if needed
+        df = pd.read_csv(file_path)
+        print(f"Data loaded successfully. Shape: {df.shape}")
+
+        # Isolate the column headers (the primary text input for Data Language identification)
+        column_headers = list(df.columns)
+        print(f"Column Headers: {column_headers}")
+        
+        return df, column_headers
+    except FileNotFoundError:
+        print(f"ERROR: File not found at {file_path}")
+        return None, None
+
+
+
+# STEP 2: identify data language and instruction language
+pip install langdetect
+from langdetect import detect
+from googletrans import Translator # We'll need this later
+
+translator = Translator()
+
+def identify_language(text_list, instruction_string):
+    """Identifies the language of the column headers and the instruction."""
+    
+    # 1. Data Language Identification (using column headers)
+    # Join the first few headers to form a single string for better detection accuracy
+    sample_text = ' '.join(text_list[:5]) 
+    try:
+        data_lang_code = detect(sample_text)
+    except Exception:
+        data_lang_code = 'en' # Default to English if detection fails
+    
+    # 2. Instruction Language Identification
+    try:
+        instruction_lang_code = detect(instruction_string)
+    except Exception:
+        instruction_lang_code = 'en' # Default to English if detection fails
+
+    print(f"\n[AGENT LOG] Detected Data Language: {data_lang_code}")
+    print(f"[AGENT LOG] Detected Instruction Language: {instruction_lang_code}")
+    
+    return data_lang_code, instruction_lang_code
+
+
+# STEP 3: Transalte columns
+pip install googletrans==4.0.0-rc1 # Use this specific version for stability
+
+def standardize_headers(df, data_lang_code, target_lang='en'):
+    """Translates column headers to the target language if necessary."""
+    
+    if data_lang_code == target_lang:
+        print("[AGENT LOG] Headers already in target language. No translation needed.")
+        return df
+    
+    print(f"[AGENT LOG] Translating headers from {data_lang_code} to {target_lang}...")
+    
+    # Create a translation dictionary
+    translation_map = {}
+    for col in df.columns:
+        # Translate each header
+        try:
+            translated_col = translator.translate(col, src=data_lang_code, dest=target_lang).text
+            # Simple cleaning (e.g., replacing spaces with underscores)
+            translation_map[col] = translated_col.replace(' ', '_').replace('.', '')
+        except Exception as e:
+            # Fallback for translation errors
+            print(f"Warning: Could not translate {col}. Keeping original name.")
+            translation_map[col] = col
+            
+    # Apply the translation
+    df.rename(columns=translation_map, inplace=True)
+    print(f"[AGENT LOG] New Headers (Standardized): {list(df.columns)}")
+    return df
+
+# Example Usage
+# df_standardized = standardize_headers(data_frame, data_lang)
+
+
+# STEP 4: Execute instructions
+
+def calculate_ratios(df):
+    """
+    Performs the core data processing (e.g., financial ratio calculation).
+    ASSUMES column names are standardized to English (e.g., 'Net_Income', 'Total_Assets').
+    """
+    
+    # Example calculation: Return on Assets (ROA)
+    if 'Net_Income' in df.columns and 'Total_Assets' in df.columns:
+        df['ROA'] = df['Net_Income'] / df['Total_Assets']
+        print("[AGENT LOG] Calculated ROA.")
+    else:
+        print("[AGENT LOG] WARNING: Required columns for ROA not found (Net_Income, Total_Assets).")
+    
+    # Example calculation: Debt-to-Equity
+    if 'Total_Debt' in df.columns and 'Shareholders_Equity' in df.columns:
+        df['Debt_to_Equity'] = df['Total_Debt'] / df['Shareholders_Equity']
+        print("[AGENT LOG] Calculated Debt_to_Equity.")
+    else:
+        print("[AGENT LOG] WARNING: Required columns for Debt-to-Equity not found.")
+        
+    return df
+
+# Example Usage
+# df_processed = calculate_ratios(df_standardized)
+
+
+
+# STEP 5: Transalte results and generate output
+
+def generate_localized_output(df, instruction_lang_code, output_ratio_cols=['ROA', 'Debt_to_Equity']):
+    """
+    Generates summary results and translates the ratio labels to the instruction language.
+    """
+    
+    # 1. Get the summary statistics for the calculated ratios
+    results = df[output_ratio_cols].describe()
+    
+    if instruction_lang_code != 'en':
+        print(f"\n[AGENT LOG] Translating output labels to {instruction_lang_code}...")
+        
+        # Translate the index (e.g., 'count', 'mean', 'std')
+        translated_index = [translator.translate(idx, dest=instruction_lang_code).text for idx in results.index]
+        results.index = translated_index
+        
+        # Translate the column headers (the ratio names)
+        translated_columns = [translator.translate(col, dest=instruction_lang_code).text for col in results.columns]
+        results.columns = translated_columns
+        
+        print(f"[AGENT LOG] Output in {instruction_lang_code}.")
+    else:
+        print(f"\n[AGENT LOG] Output in English (Instruction Language).")
+        
+    return results
+
+# Example Usage
+# final_summary = generate_localized_output(df_processed, instruction_lang)
+# print(final_summary)
+
+
+
