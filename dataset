@@ -1,0 +1,213 @@
+
+# 1. Load file
+
+import pandas as pd
+
+nome_file = 'Base.xlsx' 
+
+try:
+    df = pd.read_excel(nome_file)
+    
+    print("File Excel caricato con successo!")
+    print("-" * 30)
+    
+    print("Nomi delle colonne trovate:")
+    print(df.columns.tolist())
+ 
+    print("\nAnteprima dei dati:")
+    print(df.head(3))
+
+except Exception as e:
+    print(f" Errore: {e}")
+
+
+
+# 2. Language detector -> check column name and detect if it is in english, italian, spanish
+
+import pandas as pd
+from langdetect import detect, DetectorFactory
+
+# Garantisce risultati costanti
+DetectorFactory.seed = 0
+
+def identifica_lingua_dataset(colonne):
+    # Uniamo i nomi delle colonne in un'unica stringa per l'analisi
+    testo_colonne = " ".join([str(c).replace('_', ' ') for c in colonne])
+    
+    try:
+        lingua = detect(testo_colonne)
+        mappa_lingue = {
+            'es': 'Spagnolo (Ecuador/Latam)',
+            'it': 'Italiano',
+            'en': 'Inglese'
+        }
+        return mappa_lingue.get(lingua, f"Altra lingua rilevata: {lingua}")
+    except:
+        return "Impossibile determinare la lingua"
+
+# --- ESEMPIO D'USO ---
+# Carichiamo i tuoi dati (sostituisci con il tuo file)
+# df = pd.read_excel('tuo_file.xlsx') 
+
+mie_colonne = [
+    'anio', 'expediente', 'ingresos_ventas', 'activos', 
+    'patrimonio', 'utilidad_neta', 'n_empleados'
+]
+
+lingua_rilevata = identifica_lingua_dataset(mie_colonne)
+print(f"🌍 Lingua del Dataset: {lingua_rilevata}")
+
+# Logica per l'AI Agent
+if 'es' in lingua_rilevata.lower():
+    print("🤖 AI Agent: Configurazione parametri per il mercato Ecuadoriana attiva.")
+
+
+
+# 3. Transalte columns
+
+import pandas as pd
+from deep_translator import GoogleTranslator
+
+# 1. Caricamento Dataset
+df = pd.read_excel('Base.xlsx')
+
+# 2. Dizionario di Correzione Manuale (Il Mapping)
+# Qui inseriamo le traduzioni tecniche che l'AI potrebbe sbagliare
+mapping_manuale = {
+    'anio': 'year',
+    'expediente': 'company_id',
+    'ingresos_ventas': 'sales_revenue',
+    'ingresos_totales': 'total_revenue',
+    'utilidad_neta': 'net_income',
+    'activos': 'total_assets',
+    'patrimonio': 'equity',
+    'n_empleados': 'employees_count',
+    'ciiu_n1': 'sector_code',
+    'liquidez_corriente': 'current_ratio',
+    'prueba_acida': 'acid_test_ratio'
+}
+
+def agente_traduttore_intelligente(dataframe, target_lang='en'):
+    translator = GoogleTranslator(source='auto', target=target_lang)
+    
+    print("🤖 Agente: Inizio traduzione intelligente...")
+    nuove_colonne = {}
+    
+    for col in dataframe.columns:
+        # Se la colonna è nel nostro dizionario manuale, usiamo quella
+        if col in mapping_manuale:
+            nuove_colonne[col] = mapping_manuale[col]
+        else:
+            # Altrimenti usiamo il traduttore automatico
+            try:
+                nome_pulito = col.replace('_', ' ')
+                traduzione = translator.translate(nome_pulito)
+                nuove_colonne[col] = traduzione.lower().replace(' ', '_')
+            except:
+                nuove_colonne[col] = col # In caso di errore tiene il nome originale
+                
+    return dataframe.rename(columns=nuove_colonne)
+
+# 3. Esecuzione Traduzione
+df_tradotto = agente_traduttore_intelligente(df, target_lang='en')
+
+# 4. Analisi: Identificazione Aziende Sopra la Media
+# Calcoliamo la media del fatturato per anno
+media_settore = df_tradotto.groupby('year')['total_revenue'].transform('mean')
+df_tradotto['sector_average'] = media_settore
+
+# Flag: Chi sta performando meglio della media?
+df_tradotto['is_outperformer'] = df_tradotto['total_revenue'] > df_tradotto['sector_average']
+
+# 5. Salvataggio Risultati
+df_tradotto.to_excel('Analisi_Ecuador_Tradotta.xlsx', index=False)
+print("✅ Analisi completata! File salvato come 'Analisi_Ecuador_Tradotta.xlsx'")
+
+# Anteprima dei primi risultati
+print(df_tradotto[['year', 'company_id', 'total_revenue', 'sector_average', 'is_outperformer']].head())
+
+
+# 4. Detect outliers
+import pandas as pd
+import numpy as np
+
+# Supponiamo che df sia il tuo dataset tradotto
+def identifica_outliers_finanziari(df_tradotto):
+
+    # 1. Outliers Logici
+    df_tradotto['outlier_logico'] = (df_tradotto['total_assets'] <= 0) | (df_tradotto['sales_revenue'] <= 0)
+    
+    # 2. Margini Anomali (Utile > Fatturato)
+    df_tradotto['margine_anomalo'] = df_tradotto['net_income'] > df_tradotto['total_revenue']
+    
+    # 3. Outliers Statistici (IQR sul fatturato)
+    def is_outlier_stats(group):
+        Q1 = group.quantile(0.25)
+        Q3 = group.quantile(0.75)
+        IQR = Q3 - Q1
+        return group > (Q3 + 1.5 * IQR)
+
+    df_tradotto['super_giant'] = df_tradotto.groupby('year')['total_revenue'].transform(is_outlier_stats)
+    
+    return df_tradotto
+
+df_analisi = identifica_outliers_finanziari(df_tradotto)
+
+# Vediamo quante aziende abbiamo "flaggato"
+riepilogo_annuale = df_analisi.groupby('year')[['outlier_logico', 'margine_anomalo', 'super_giant']].sum()
+print("\n📊 Riepilogo Outliers identificati per ANNO:")
+print(riepilogo_annuale)
+
+
+# 5. Identify missing values
+# 5. Identify missing values
+print("\n--- ANALISI VALORI MANCANTI ---")
+
+# 1. Calcolo totale dei valori mancanti per ogni colonna
+missing_totali = df_tradotto.isnull().sum()
+# Filtriamo per mostrare solo le colonne che hanno almeno un valore mancante
+print("\n🔍 Colonne con valori mancanti (totale):")
+print(missing_totali[missing_totali > 0])
+
+# 2. Analisi dei Missing Values per ANNO
+# Definiamo le colonne finanziarie più importanti per il tuo AI Agent
+colonne_chiave = ['total_revenue', 'net_income', 'total_assets', 'sales_revenue', 'employees_count']
+
+# Verifichiamo quali di queste colonne sono presenti nel dataset dopo la traduzione
+colonne_esistenti = [c for c in colonne_chiave if c in df_tradotto.columns]
+
+# Creiamo una tabella che mostra quanti dati mancano per ogni anno
+missing_per_anno = df_tradotto.groupby('year')[colonne_esistenti].apply(lambda x: x.isnull().sum())
+
+print("\n📊 Conteggio Valori Mancanti per ANNO (Variabili Chiave):")
+print(missing_per_anno)
+
+# 3. Visualizzazione in Percentuale (%)
+# Questo ti dice quanto è "grave" la mancanza di dati ogni anno
+missing_percent_anno = (df_tradotto.groupby('year')[colonne_esistenti].apply(lambda x: x.isnull().mean()) * 100).round(2)
+
+print("\n📈 Percentuale (%) di Missing Values per ANNO:")
+print(missing_percent_anno)
+
+
+
+# 6. Keep data from 2018
+# 6. Filter by year (2018 onwards)
+print("\n--- FILTRAGGIO TEMPORALE ---")
+
+# Controlliamo quante righe abbiamo prima del filtro
+righe_prima = len(df_analisi)
+
+# Manteniamo solo i dati dal 2018 compreso in avanti
+df_filtrato = df_analisi[df_analisi['year'] >= 2018].copy()
+
+# Controlliamo quante righe abbiamo dopo il filtro
+righe_dopo = len(df_filtrato)
+
+print(f"✅ Filtro applicato: {df_filtrato['year'].min()} - {df_filtrato['year'].max()}")
+print(f"Righe rimosse (periodo 2016-2017): {righe_prima - righe_dopo}")
+print(f"Righe rimanenti per l'analisi: {righe_dopo}")
+
+# Verifica rapida degli anni rimasti
+print("\nDistribuzione delle aziende per anno:")
+print(df_filtrato['year'].value_counts().sort_index())
