@@ -1,5 +1,235 @@
 # Thought Process and Design Choices
 
+## 0. Project Architecture
+
+User
+ ↓
+Chat Interface
+ ↓
+LLM (Agent / Orchestrator)
+ ↓ decides
+ ├─ SQL retrieval (SQLite)
+ ├─ Financial analysis functions
+ ├─ Visualization functions
+ ↓
+Results (text + dashboard)
+
+-
+
+[User Question]
+        ↓
+[Intent + Task Planning Node]
+        ↓
+[SQL Retrieval Node]
+        ↓
+[Financial Analysis Node]
+        ↓
+[Visualization Decision Node]
+        ↓
+[Response Composer]
+
+-
+
+User question
+   ↓
+Planner (LLM → JSON plan)
+   ↓
+Plan validation (Pydantic)
+   ↓
+Data retrieval (SQLite)
+   ↓
+Financial computations
+   ↓
+Visualization (if useful)
+   ↓
+LLM explanation
+
+## 0bis. Project Plan
+
+This plan assumes:
+
+- You already have a SQLite DB
+- You want a ChatGPT-like UX
+- You want open-source LLMs
+- You want deterministic financial analysis
+
+### PHASE 0 — Ground truth (½ day)
+🎯 Goal: Make sure your data is not the unknown.
+
+Tasks
+
+1. Inspect your SQLite DB:
+	- Tables
+	- Columns
+	- Date formats
+	- Metric names
+2. Decide:
+	- Canonical metric names (e.g. revenue, ebitda)
+	- Time column (date, period_end, etc.)
+3. Deliverable: A 1-page schema reference (even a README is fine).
+
+👉 Nothing AI-related yet.
+
+### PHASE 1 — Deterministic backend (1 day)
+🎯 Goal: Have a rock-solid analytics engine without any LLM.
+
+Tasks
+
+1. Write SQL access functions
+	- No dynamic SQL
+	- One function per use case
+
+2. Write financial tools
+	- YoY growth
+	- Rolling averages
+	- Margins
+
+3. Write visualization functions
+	- Line chart
+	- Bar chart
+
+4. Deliverable: A Python script where:
+	- df = load_revenue_timeseries()
+	- df2 = yoy_growth(df)
+	- plot(df2)
+
+
+👉 If this is broken, the agent will be broken.
+
+### PHASE 2 — Minimal chat UI (½ day)
+🎯 Goal: User can ask a question and see something happen.
+
+Tasks
+
+1. Build a Streamlit chat
+
+
+2. Hard-code:
+	- One query
+	- One metric
+	- One plot
+
+3. Deliverable
+- User types:
+	- “Show revenue over time”
+- And sees:
+	- A chart
+	- A placeholder text
+
+👉 Still no LLM.
+
+### PHASE 3 — LLM as planner (1 day)
+
+🎯 Goal: LLM converts questions → structured plan.
+
+Tasks
+
+1. Choose LLM runtime:
+	- Ollama + Mistral 7B
+
+2. Write planner system prompt
+
+3. Enforce JSON-only output
+
+4. Validate with Pydantic
+
+5. Deliverable
+	- plan = planner("Is revenue growing?")
+	- assert plan.metrics == ["revenue"]
+
+
+👉 The LLM does not touch the DB yet.
+
+### PHASE 4 — Agent controller (1 day)
+
+🎯 Goal: Wire plan → execution.
+
+Tasks
+
+1. Create AgentController
+
+2. Map:
+
+	- plan.metrics → SQL loader
+	- plan.analysis → Python functions
+	- plan.visualization → plotting
+
+3. Add failure handling:
+
+	- Invalid plan → retry
+	- Missing metric → graceful message
+
+4. Deliverable
+	- User question → correct data pipeline.
+
+### PHASE 5 — Explanation LLM (½ day)
+
+🎯 Goal: Results explained clearly, not magically.
+
+Tasks
+
+1. Write explainer prompt
+
+2. Pass only computed summaries
+
+3. Forbid new numbers
+
+4. Deliverable
+	- Text explanation that matches charts.
+
+### PHASE 6 — UX polish (½ day)
+🎯 Goal: Feels like one integrated assistant.
+
+Tasks
+
+1. Streaming responses
+
+2. Loading indicators
+
+3. Clear errors:
+	- “This question requires data not available”
+
+4. Deliverable
+	- Smooth chat experience.
+
+### PHASE 7 — Guardrails & evaluation (½–1 day)
+
+🎯 Goal: Prevent embarrassing failures.
+
+Tasks
+
+1. Reject:
+
+	- SQL injection attempts
+	- Role overrides
+
+2. Log:
+	- User question
+	- Plan
+	- Actions
+
+3. Test with:
+	- Ambiguous questions
+	- Bad inputs
+
+4. Deliverable
+	- Agent behaves predictably.
+
+#### Final MVP checklist (what you can demo)
+
+✅ User types free-form financial questions
+
+✅ Agent chooses metrics and analysis
+
+✅ Data pulled from SQLite
+
+✅ Charts shown when useful
+
+✅ Explanation matches data
+
+✅ No paid APIs
+
+
 ## 1. Database Format Choice: SQLite for storage
 
 We selected SQLite as our primary database because the project data is structured, relational, and requires frequent querying and aggregation. SQLite offers SQL support, indexing, and schema enforcement while remaining lightweight and file-based, making it ideal for a self-contained AI agent. CSV files are used only as an ingestion format, while Polars is employed for high-performance analytical processing after data retrieval.
