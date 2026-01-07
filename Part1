@@ -1,0 +1,104 @@
+# 1. LOAD FILE
+
+import pandas as pd
+file = 'Data_n.xlsx' 
+
+try:
+    df = pd.read_excel(file)
+    print("-" * 30)
+    print("Columns name:")
+    print(df.columns.tolist())
+    print(df.head(3))
+except Exception as e:
+    print(f" Error: {e}")
+
+
+
+# 2. LANGUAGE DETECTOR -> Check columns name and detect if data are in en, sp, it, fr
+
+import pandas as pd
+from langdetect import detect, DetectorFactory
+
+DetectorFactory.seed = 0
+
+def identify_language(columns):
+    # Concatenate column names into a single string
+    col_text = " ".join([str(c).replace('_', ' ') for c in columns])
+    
+    try:
+      return detect(col_text)
+    except Exception as e:
+        print({e})
+        return 'en'  
+
+lang_code = identify_language(df.columns)
+print(f"Detected ISO code: {lang_code}")
+
+
+
+# 3. TRANSALATE TO ENGLISH
+
+import pandas as pd
+import re
+from deep_translator import GoogleTranslator
+from thefuzz import process, fuzz
+
+# 1. MULTILINGUAL TECHNICAL DICTIONARY
+# Keys are the target English terms; values are variations in other languages (IT, ES, FR)
+TECHNICAL_MAP = {
+    'assets': ['attiva', 'attivita', 'activos', 'activo', 'actifs', 'actif', 'assets'],
+    'equity': ['patrimonio', 'patrimoine', 'equity', 'capitale netto'],
+    'net_income': ['utile netto', 'utilidad neta', 'bénéfice net', 'net income'],
+    'year': ['anno', 'anio', 'año', 'année', 'year'],
+    'id': ['expediente', 'identificativo', 'id', 'codice'],
+    'leverage': ['leva finanziaria', 'apalancamiento', 'levier financier', 'leverage'],
+    'current_ratio': ['liquidita corrente', 'liquidez corriente', 'ratio de liquidité', 'current ratio'],
+    'total_expenses': ['spese totali', 'total gastos', 'total des dépenses', 'total expenses']
+}
+
+def translate_and_standardize(columns, lang_code):
+    translator = GoogleTranslator(source=lang_code, target='en')
+    new_columns = []
+
+    for col in columns:
+        # A. Initial Normalization
+        # Convert to lowercase and remove leading/trailing whitespace
+        original_col = str(col).lower().strip()
+        
+        # Handle numeric suffixes (e.g., 'activo_1' or 'assets_2')
+        suffix_match = re.search(r'[_-](\d+)$', original_col)
+        suffix = f"_{suffix_match.group(1)}" if suffix_match else ""
+        
+        # Clean the name for matching by removing suffixes and replacing underscores with spaces
+        clean_name = re.sub(r'[_-]\d+$', '', original_col).replace('_', ' ').strip()
+
+        # B. Standardization
+        standard_term = None
+        for eng_term, variations in TECHNICAL_MAP.items():
+            match, score = process.extractOne(clean_name, variations, scorer=fuzz.token_sort_ratio)
+            # If the similarity score is high enough (threshold > 85), use the predefined English key
+            if score > 85: 
+                standard_term = eng_term
+                break
+        
+        # C. Translation if the term was not found in the technical dictionary 
+        if not standard_term:
+            if lang_code == 'en':
+                standard_term = clean_name 
+            else:
+                try:
+                    translated = translator.translate(clean_name).lower()
+                    standard_term = translated.replace(' ', '_')
+                except:
+                    standard_term = clean_name 
+
+        # D. Final Formatting: ensure snake_case and re-attach the numeric suffix if it existed
+        final_name = standard_term.replace(' ', '_') + suffix
+        new_columns.append(final_name)
+    
+    return new_columns
+
+old_columns = df.columns.tolist()
+df.columns = translate_and_standardize(df.columns, lang_code)
+
+print("\nFinal list of columns:", df.columns.tolist())
