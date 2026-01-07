@@ -1,0 +1,310 @@
+####################
+### 1. LOAD FILE ###
+####################
+
+import pandas as pd
+file = 'Data_n.xlsx' 
+
+try:
+    df = pd.read_excel(file)
+    print("-" * 30)
+    print("Columns name:")
+    print(df.columns.tolist())
+    print(df.head(3))
+except Exception as e:
+    print(f" Error: {e}")
+
+
+
+############################
+### 2. LANGUAGE DETECTOR ###
+############################
+
+import pandas as pd
+from langdetect import detect, DetectorFactory
+
+DetectorFactory.seed = 0
+
+def identify_language(columns):
+    # Concatenate column names into a single string
+    col_text = " ".join([str(c).replace('_', ' ') for c in columns])
+    
+    try:
+      return detect(col_text)
+    except Exception as e:
+        print({e})
+        return 'en'  
+
+lang_code = identify_language(df.columns)
+print(f"Detected ISO code: {lang_code}")
+
+
+
+################################
+### 3. TRANSALATE TO ENGLISH ###
+################################
+
+import pandas as pd
+import re
+from deep_translator import GoogleTranslator
+from thefuzz import process, fuzz
+
+# 1. MULTILINGUAL TECHNICAL DICTIONARY
+# Keys are the target English terms; values are variations in other languages (IT, ES, FR)
+TECHNICAL_MAP = {
+    'assets': ['attiva', 'attivita', 'activos', 'activo', 'actifs', 'actif', 'assets'],
+    'equity': ['patrimonio', 'patrimoine', 'equity', 'capitale netto'],
+    'net_income': ['utile netto', 'utilidad neta', 'bénéfice net', 'net income'],
+    'year': ['anno', 'anio', 'año', 'année', 'year'],
+    'id': ['expediente', 'identificativo', 'id', 'codice'],
+    'leverage': ['leva finanziaria', 'apalancamiento', 'levier financier', 'leverage'],
+    'current_ratio': ['liquidita corrente', 'liquidez corriente', 'ratio de liquidité', 'current ratio'],
+    'total_expenses': ['spese totali', 'total gastos', 'total des dépenses', 'total expenses']
+}
+
+def translate_and_standardize(columns, lang_code):
+    translator = GoogleTranslator(source=lang_code, target='en')
+    new_columns = []
+
+    for col in columns:
+        # A. Initial Normalization
+        # Convert to lowercase and remove leading/trailing whitespace
+        original_col = str(col).lower().strip()
+        
+        # Handle numeric suffixes (e.g., 'activo_1' or 'assets_2')
+        suffix_match = re.search(r'[_-](\d+)$', original_col)
+        suffix = f"_{suffix_match.group(1)}" if suffix_match else ""
+        
+        # Clean the name for matching by removing suffixes and replacing underscores with spaces
+        clean_name = re.sub(r'[_-]\d+$', '', original_col).replace('_', ' ').strip()
+
+        # B. Standardization
+        standard_term = None
+        for eng_term, variations in TECHNICAL_MAP.items():
+            match, score = process.extractOne(clean_name, variations, scorer=fuzz.token_sort_ratio)
+            # If the similarity score is high enough (threshold > 85), use the predefined English key
+            if score > 85: 
+                standard_term = eng_term
+                break
+        
+        # C. Translation if the term was not found in the technical dictionary 
+        if not standard_term:
+            if lang_code == 'en':
+                standard_term = clean_name 
+            else:
+                try:
+                    translated = translator.translate(clean_name).lower()
+                    standard_term = translated.replace(' ', '_')
+                except:
+                    standard_term = clean_name 
+
+        # D. Final Formatting: ensure snake_case and re-attach the numeric suffix if it existed
+        final_name = standard_term.replace(' ', '_') + suffix
+        new_columns.append(final_name)
+    
+    return new_columns
+
+old_columns = df.columns.tolist()
+df.columns = translate_and_standardize(df.columns, lang_code)
+
+print("\nFinal list of columns:", df.columns.tolist())
+
+
+
+################################################
+### 4. OUTLIERS and MISSING VALUES DETECTION ###
+################################################
+
+import pandas as pd
+import numpy as np
+
+def identify_financial_outliers(df):
+
+    # 1. Logical Outliers: Flagging companies with zero/negative assets or zero/negative sales income
+    df['logical_outlier'] = (df['assets'] <= 0) | (df['sales_income'] <= 0)
+    
+    # 2. Anomalous Margins: Flagging cases where Net Income is strictly greater than Total Income
+    df['anomalous_margin'] = df['net_income'] > df['total_income']
+    
+    # 3. Statistical Outliers: Identifying "Super Giants" based on Total Income using IQR
+    def is_outlier_stats(group):
+        Q1 = group.quantile(0.25)
+        Q3 = group.quantile(0.75)
+        IQR = Q3 - Q1
+        return group > (Q3 + 1.5 * IQR)
+    
+    # We group by year to ensure we compare companies within the same economic period
+    df['super_giant'] = df.groupby('year')['total_income'].transform(is_outlier_stats)
+    
+    return df
+
+df_analysis = identify_financial_outliers(df)
+
+outlier_summary = df_analysis.groupby('year')[['logical_outlier', 'anomalous_margin', 'super_giant']].sum()
+print("\n Outlier Summary identified by year:")
+print(outlier_summary)
+
+outlier_cols = ['logical_outlier', 'anomalous_margin', 'super_giant']
+outlier_percentage = (df_analysis.groupby('year')[outlier_cols].mean() * 100).round(2)
+print(outlier_percentage)
+
+
+# IDENTIFY MISSING VALUES
+print("\n--- MISSING VALUES ANALYSIS ---")
+
+# We replace empty strings, strings with only spaces, and optionally zeros 
+# (only if zero is not a valid financial value for that column)
+df= df.replace(r'^\s*$', np.nan, regex=True)
+
+# 1. Calculate the total count of missing values per column
+missing_totals = df.isnull().sum()
+# Filter to show only the columns that have at least one missing value
+print("\nColonne con valori mancanti (totale):")
+print(missing_totals[missing_totals > 0])
+
+# 2. Missing Values Analysis by YEAR
+key_financial_columns = ['total_income', 'net_income', 'assets', 'sales_income', 'n_employees']
+
+# Check which of these columns actually exist in the dataframe to avoid errors
+existing_cols = [c for c in key_financial_columns if c in df.columns]
+
+# Create a table showing the count of missing data for key variables per year
+missing_by_year = df.groupby('year')[existing_cols].apply(lambda x: x.isnull().sum())
+
+print("\nMissing Values Count by YEAR (Key Variables):")
+print(missing_by_year)
+
+# 3. Percentage Analysis (%)
+# This indicates the "severity" of data gaps for each year
+missing_percent_year = (df.groupby('year')[existing_cols].apply(lambda x: x.isnull().mean()) * 100).round(2)
+
+print("\nPercentage (%) of Missing Values by YEAR:")
+print(missing_percent_year)
+
+
+# 1. Store the initial number of rows to calculate how many we removed
+initial_count = len(df_analysis)
+
+# 2. Filter the DataFrame
+# We keep only the rows where 'logical_outlier' is False
+df_cleaned = df_analysis[df_analysis['logical_outlier'] == False].copy()
+
+# 3. Calculate the number of removed records
+removed_count = initial_count - len(df_cleaned)
+
+print(f"--- CLEANING REPORT ---")
+print(f"Initial records: {initial_count}")
+print(f"Records removed (Logical Outliers): {removed_count}")
+print(f"Remaining records in 'df_cleaned': {len(df_cleaned)}")
+
+# 4. Verify that the problem in 2023 is resolved or reduced
+outlier_check_2023 = (df_cleaned[df_cleaned['year'] == 2023]['logical_outlier']).sum()
+print(f"\nLogical outliers remaining in 2023: {outlier_check_2023}")
+
+
+# CLEAN OUTLIERS
+
+# 1. Store the initial number of rows to calculate how many we removed
+initial_count = len(df_analysis)
+
+# 2. Filter the DataFrame
+# Keep only the rows where 'logical_outlier' is False
+df_cleaned = df[df['logical_outlier'] == False].copy()
+
+# 3. Calculate the number of removed records
+removed_count = initial_count - len(df_cleaned)
+
+print(f"--- CLEANING REPORT ---")
+print(f"Initial records: {initial_count}")
+print(f"Records removed (Logical Outliers): {removed_count}")
+print(f"Remaining records in 'df_cleaned': {len(df_cleaned)}")
+
+# 4. Verify that the problem in 2023 is resolved or reduced
+outlier_check_2023 = (df_cleaned[df_cleaned['year'] == 2023]['logical_outlier']).sum()
+print(f"\nLogical outliers remaining in 2023: {outlier_check_2023}")
+
+
+
+###############################
+### 5. FINANCIAL INDICATORS ###
+###############################
+
+# Create a new DataFrame for indicators
+df_indicators = df_cleaned.copy()
+
+# 1. Profitability Ratios
+df_indicators['roa'] = df_indicators['net_income'] / df_indicators['assets']
+df_indicators['roe'] = df_indicators['net_income'] / df_indicators['equity']
+df_indicators['net_margin'] = df_indicators['net_income'] / df_indicators['total_income']
+
+# 2. Solvency Ratios
+# Avoiding division by zero for equity
+df_indicators['debt_to_equity'] = df_indicators['total_debt'] / df_indicators['equity'].replace(0, np.nan)
+
+# 3. Efficiency Ratios
+df_indicators['asset_turnover'] = df_indicators['total_income'] / df_indicators['assets']
+df_indicators['revenue_per_employee'] = df_indicators['total_income'] / df_indicators['n_employees'].replace(0, np.nan)
+
+# Replace infinite values (caused by division by very small numbers) with NaN
+df_indicators = df_indicators.replace([np.inf, -np.inf], np.nan)
+
+print("\nFinancial Indicators calculated successfully.")
+print(df_indicators[['roa', 'roe', 'debt_to_equity', 'asset_turnover']].head())
+
+
+# COMMERCIAL SECTOR BENCHMARKING
+
+# Indicators most relevant for the commercial sector
+# Asset Turnover is key here because retail/wholesale relies on moving inventory
+commercial_indicators = ['roa', 'net_margin', 'asset_turnover', 'revenue_per_employee']
+
+# Calculate the Sector Median for each year
+sector_benchmarks = df_indicators.groupby('year')[commercial_indicators].median().reset_index()
+
+# Rename for clarity: these represent the "Typical Commercial Firm" that year
+sector_benchmarks.columns = ['year'] + [f'median_sector_{ind}' for ind in commercial_indicators]
+
+# Merge benchmarks into the main dataset
+df_final_analysis = pd.merge(df_indicators, sector_benchmarks, on='year', how='left')
+
+# Calculate the performance ratio (Company Value / Sector Median)
+for ind in commercial_indicators:
+    df_final_analysis[f'performance_{ind}'] = df_final_analysis[ind] / df_final_analysis[f'median_sector_{ind}']
+
+# Categorize companies based on ROA performance
+def categorize_performance(ratio):
+    if ratio >= 1.5: return 'Top Performer'
+    if ratio >= 0.8: return 'Average'
+    return 'Underperformer'
+
+df_final_analysis['market_position'] = df_final_analysis['performance_roa'].apply(categorize_performance)
+
+print("\nCommercial Sector Positioning Summary:")
+print(df_final_analysis.groupby(['year', 'market_position']).size().unstack().fillna(0))
+
+
+def generate_advisor_comments(row):
+    comments = []
+    
+    # Logic for Market Position
+    if row['market_position'] == 'Top Performer':
+        comments.append("Outstanding efficiency: Your firm significantly exceeds the commercial sector median.")
+    elif row['market_position'] == 'Underperformer':
+        comments.append("Action required: Profitability or Asset Turnover is below industry standards.")
+    
+    # Logic for Debt (Solvency)
+    if 'performance_debt' in row and row['performance_debt'] > 1.2:
+        comments.append("High Leverage Alert: Your debt level is 20% higher than your commercial peers.")
+    
+    # Logic for Efficiency
+    if 'performance_asset_turnover' in row and row['performance_asset_turnover'] < 0.8:
+        comments.append("Inventory Warning: Low asset turnover suggests slow-moving stock or supply chain bottlenecks.")
+
+    # Return as a single string
+    return " | ".join(comments) if comments else "Stable: Performance is aligned with sector averages."
+
+# Apply the function to create the new column
+df_final_analysis['ai_advisor_comments'] = df_final_analysis.apply(generate_advisor_comments, axis=1)
+
+# Check the results for a few companies
+print(df_final_analysis[['id', 'year', 'market_position', 'ai_advisor_comments']].head())
