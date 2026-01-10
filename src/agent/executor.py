@@ -1,36 +1,28 @@
 # src/agent/executor.py
 
 """
-Plan execution module with comprehensive error handling
--------------------------------------------------------
+Sequential plan execution module with state management
+------------------------------------------------------
 
-Executes plans created by planner, handling all validation errors gracefully.
+Executes multi-step plans, maintaining state between steps.
 """
 
-from typing import Any, Dict, Optional, Union
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 import plotly.graph_objects as go
 import polars as pl
 
 from src.tools.analysis import (
     ValidationError,
-    aggregate_by_group,
     compute_margin,
     compute_share,
-    compute_summary_stats,
-    filter_by_condition,
     find_plottable_metric,
     flag_invalid_values,
-    group_summary_stats,
     is_plottable,
     load_processed_data,
     rolling_average,
-    select_top_k,
     yoy_growth,
-)
-from src.tools.mapping import (
-    execute_tool_safely,
-    get_tool_metadata,
 )
 from src.tools.visualization import (
     VisualizationError,
@@ -40,564 +32,609 @@ from src.tools.visualization import (
 )
 
 # ============================================================
+# Execution State
+# ============================================================
+
+
+class ExecutionState:
+    """
+    Maintains state across execution steps.
+
+    Tracks:
+    - Current DataFrame
+    - Generated visualizations
+    - Summary statistics
+    - Exported files
+    """
+
+    def __init__(self, initial_df: pl.DataFrame):
+        self.df = initial_df
+        self.visualizations: List[go.Figure] = []
+        self.tables: List[Dict[str, Any]] = []
+        self.exports: List[str] = []
+        self.metadata: Dict[str, Any] = {}
+
+    def update_df(self, new_df: pl.DataFrame) -> None:
+        """Update the working DataFrame."""
+        self.df = new_df
+
+    def add_visualization(self, fig: go.Figure, title: str = None) -> None:
+        """Add a visualization to results."""
+        self.visualizations.append({"figure": fig, "title": title})
+
+    def add_table(self, data: Any, title: str = None) -> None:
+        """Add a table/data result."""
+        self.tables.append({"data": data, "title": title})
+
+    def add_export(self, filepath: str) -> None:
+        """Record an exported file."""
+        self.exports.append(filepath)
+
+    def get_summary(self) -> Dict[str, Any]:
+        """Get summary of execution state."""
+        return {
+            "dataframe_shape": self.df.shape,
+            "num_visualizations": len(self.visualizations),
+            "num_tables": len(self.tables),
+            "num_exports": len(self.exports),
+            "metadata": self.metadata,
+        }
+
+
+# ============================================================
 # Execution Result
 # ============================================================
 
 
 class ExecutionResult:
-    """Container for execution results with status and metadata."""
+    """Result of executing a plan or step."""
 
     def __init__(
         self,
         success: bool,
-        result: Any = None,
+        state: Optional[ExecutionState] = None,
         error: Optional[str] = None,
         error_type: Optional[str] = None,
-        action: Optional[str] = None,
-        fallback_used: bool = False,
-        warning: Optional[str] = None,
+        warnings: Optional[List[str]] = None,
     ):
         self.success = success
-        self.result = result
+        self.state = state
         self.error = error
         self.error_type = error_type
-        self.action = action
-        self.fallback_used = fallback_used
-        self.warning = warning
+        self.warnings = warnings or []
 
-    def __repr__(self) -> str:
-        if self.success:
-            return f"ExecutionResult(success=True, action={self.action})"
-        return f"ExecutionResult(success=False, error={self.error_type}: {self.error})"
+    def add_warning(self, warning: str) -> None:
+        """Add a warning message."""
+        self.warnings.append(warning)
 
 
 # ============================================================
-# Utility Functions
+# Step Executors - Data Operations
 # ============================================================
 
 
-def _normalize_company_ids(company_ids: Any) -> Optional[list]:
-    """Normalize company IDs to list of integers."""
-    if company_ids is None:
-        return None
+def _execute_filter_data(
+    state: ExecutionState, step: Dict[str, Any]
+) -> ExecutionResult:
+    """
+    Filter the current DataFrame by conditions.
 
-    if isinstance(company_ids, (list, tuple)):
-        return [int(c) for c in company_ids]
+    Conditions format:
+    [{"column": "year", "operator": ">=", "value": 2020}]
+    """
+    conditions = step["conditions"]
 
-    return [int(company_ids)]
-
-
-def _load_data(path: str = "data/processed.csv") -> pl.DataFrame:
-    """Load data with error handling."""
     try:
-        return load_processed_data(path)
+        filtered_df = state.df
+
+        for condition in conditions:
+            col = condition["column"]
+            op = condition["operator"]
+            value = condition["value"]
+
+            if op == "==":
+                filtered_df = filtered_df.filter(pl.col(col) == value)
+            elif op == "!=":
+                filtered_df = filtered_df.filter(pl.col(col) != value)
+            elif op == ">":
+                filtered_df = filtered_df.filter(pl.col(col) > value)
+            elif op == "<":
+                filtered_df = filtered_df.filter(pl.col(col) < value)
+            elif op == ">=":
+                filtered_df = filtered_df.filter(pl.col(col) >= value)
+            elif op == "<=":
+                filtered_df = filtered_df.filter(pl.col(col) <= value)
+            elif op == "in":
+                filtered_df = filtered_df.filter(pl.col(col).is_in(value))
+            else:
+                return ExecutionResult(
+                    success=False,
+                    error=f"Unknown operator: {op}",
+                    error_type="InvalidOperator",
+                )
+
+        if filtered_df.is_empty():
+            return ExecutionResult(
+                success=False,
+                error="Filters resulted in empty dataset",
+                error_type="EmptyDataset",
+            )
+
+        state.update_df(filtered_df)
+        state.metadata["last_filter"] = conditions
+
+        result = ExecutionResult(success=True, state=state)
+        result.add_warning(f"Filtered from {len(state.df)} to {len(filtered_df)} rows")
+
+        return result
+
     except Exception as e:
-        raise ValueError(f"Failed to load data from {path}: {e}")
+        return ExecutionResult(
+            success=False,
+            error=str(e),
+            error_type="FilterError",
+        )
+
+
+def _execute_compute_summary_stats(
+    state: ExecutionState, step: Dict[str, Any]
+) -> ExecutionResult:
+    """Compute summary statistics for columns."""
+
+    columns = step["columns"]
+    group_by = step.get("group_by")
+
+    try:
+        if group_by:
+            # Grouped summary
+            summary = state.df.group_by(group_by).agg(
+                [pl.col(col).mean().alias(f"{col}_mean") for col in columns]
+                + [pl.col(col).median().alias(f"{col}_median") for col in columns]
+                + [pl.col(col).std().alias(f"{col}_std") for col in columns]
+                + [pl.col(col).min().alias(f"{col}_min") for col in columns]
+                + [pl.col(col).max().alias(f"{col}_max") for col in columns]
+                + [pl.col(col).count().alias(f"{col}_count") for col in columns]
+            )
+        else:
+            # Overall summary
+            summary = state.df.select(columns).describe()
+
+        state.add_table(summary, title=f"Summary Statistics: {', '.join(columns)}")
+
+        return ExecutionResult(success=True, state=state)
+
+    except Exception as e:
+        return ExecutionResult(
+            success=False,
+            error=str(e),
+            error_type="SummaryStatsError",
+        )
+
+
+def _execute_export_table(
+    state: ExecutionState, step: Dict[str, Any]
+) -> ExecutionResult:
+    """Export current data to file."""
+
+    format_type = step["format"].lower()
+    filename = step["filename"]
+    columns = step.get("columns")
+
+    try:
+        # Select columns if specified
+        export_df = state.df.select(columns) if columns else state.df
+
+        # Ensure output directory exists
+        output_path = Path("outputs")
+        output_path.mkdir(exist_ok=True)
+
+        filepath = output_path / filename
+
+        if format_type == "csv":
+            export_df.write_csv(filepath)
+        elif format_type == "excel":
+            export_df.write_excel(filepath)
+        else:
+            return ExecutionResult(
+                success=False,
+                error=f"Unsupported format: {format_type}",
+                error_type="InvalidFormat",
+            )
+
+        state.add_export(str(filepath))
+
+        result = ExecutionResult(success=True, state=state)
+        result.add_warning(f"Exported to {filepath}")
+
+        return result
+
+    except Exception as e:
+        return ExecutionResult(
+            success=False,
+            error=str(e),
+            error_type="ExportError",
+        )
 
 
 # ============================================================
-# Action Executors
+# Step Executors - Analysis Operations
 # ============================================================
 
 
-def _execute_plot_trend(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[go.Figure, ExecutionResult]:
-    """
-    Execute plot_trend action with fallback to plottable metric.
+def _execute_yoy_growth(state: ExecutionState, step: Dict[str, Any]) -> ExecutionResult:
+    """Calculate year-over-year growth."""
 
-    Args:
-        df: Data DataFrame
-        plan: Plan dictionary with 'metric' and optional 'company_ids'
-
-    Returns:
-        Plotly Figure or ExecutionResult with error
-    """
-    metric = plan["metric"]
-    company_ids = _normalize_company_ids(plan.get("company_ids"))
-
-    # Try to find plottable metric (with fallback)
-    try:
-        plottable_metric = find_plottable_metric(
-            df,
-            preferred=metric,
-            company_ids=company_ids,
-        )
-
-        fallback_used = plottable_metric != metric
-        warning = None
-
-        if fallback_used:
-            warning = (
-                f"Metric '{metric}' has insufficient data. "
-                f"Using '{plottable_metric}' instead."
-            )
-
-        # Create plot
-        fig = plot_metric_trend(
-            df=df,
-            metric=plottable_metric,
-            company_ids=company_ids,
-        )
-
-        return ExecutionResult(
-            success=True,
-            result=fig,
-            action="plot_trend",
-            fallback_used=fallback_used,
-            warning=warning,
-        )
-
-    except (ValidationError, VisualizationError) as e:
-        return ExecutionResult(
-            success=False,
-            error=str(e),
-            error_type=type(e).__name__,
-            action="plot_trend",
-        )
-
-
-def _execute_compare_companies(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[go.Figure, ExecutionResult]:
-    """
-    Execute compare_companies action with fallback to plottable metric.
-
-    Args:
-        df: Data DataFrame
-        plan: Plan dictionary with 'metric', 'year', and optional 'company_ids'
-
-    Returns:
-        Plotly Figure or ExecutionResult with error
-    """
-    metric = plan["metric"]
-    year = int(plan["year"])
-    company_ids = _normalize_company_ids(plan.get("company_ids"))
-
-    # Try to find plottable metric for this year
-    try:
-        plottable_metric = find_plottable_metric(
-            df,
-            preferred=metric,
-            company_ids=company_ids,
-            year=year,
-        )
-
-        fallback_used = plottable_metric != metric
-        warning = None
-
-        if fallback_used:
-            warning = (
-                f"Metric '{metric}' has insufficient data for year {year}. "
-                f"Using '{plottable_metric}' instead."
-            )
-
-        # Create plot
-        fig = plot_company_comparison(
-            df=df,
-            metric=plottable_metric,
-            year=year,
-            company_ids=company_ids,
-        )
-
-        return ExecutionResult(
-            success=True,
-            result=fig,
-            action="compare_companies",
-            fallback_used=fallback_used,
-            warning=warning,
-        )
-
-    except (ValidationError, VisualizationError) as e:
-        return ExecutionResult(
-            success=False,
-            error=str(e),
-            error_type=type(e).__name__,
-            action="compare_companies",
-        )
-
-
-def _execute_correlation(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[go.Figure, ExecutionResult]:
-    """
-    Execute correlation action, filtering to plottable metrics.
-
-    Args:
-        df: Data DataFrame
-        plan: Plan dictionary with 'metrics' (list)
-
-    Returns:
-        Plotly Figure or ExecutionResult with error
-    """
-    requested_metrics = plan["metrics"]
-
-    # Filter to plottable metrics
-    plottable_metrics = [
-        m for m in requested_metrics if is_plottable(df, m, min_non_null=3)
-    ]
-
-    if len(plottable_metrics) < 2:
-        return ExecutionResult(
-            success=False,
-            error=(
-                f"Need at least 2 plottable metrics for correlation. "
-                f"Requested: {requested_metrics}, "
-                f"Plottable: {plottable_metrics}"
-            ),
-            error_type="ValidationError",
-            action="correlation",
-        )
-
-    warning = None
-    if len(plottable_metrics) < len(requested_metrics):
-        excluded = set(requested_metrics) - set(plottable_metrics)
-        warning = f"Excluded metrics with insufficient data: {excluded}"
-
-    # Create plot
-    try:
-        fig = plot_correlation_heatmap(df, plottable_metrics)
-
-        return ExecutionResult(
-            success=True,
-            result=fig,
-            action="correlation",
-            fallback_used=len(plottable_metrics) < len(requested_metrics),
-            warning=warning,
-        )
-
-    except (ValidationError, VisualizationError) as e:
-        return ExecutionResult(
-            success=False,
-            error=str(e),
-            error_type=type(e).__name__,
-            action="correlation",
-        )
-
-
-def _execute_yoy_growth(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[pl.DataFrame, ExecutionResult]:
-    """
-    Execute yoy_growth action.
-
-    Args:
-        df: Data DataFrame
-        plan: Plan dictionary with 'metric' and optional 'periods', 'output_col'
-
-    Returns:
-        DataFrame with growth column or ExecutionResult with error
-    """
-    metric = plan["metric"]
-    periods = plan.get("periods", 1)
-    output_col = plan.get("output_col", "yoy_growth")
+    metric = step["metric"]
+    periods = step.get("periods", 1)
+    output_col = step.get("output_col", "yoy_growth")
 
     try:
         result_df = yoy_growth(
-            df=df,
+            df=state.df,
             value_col=metric,
             periods=periods,
             output_col=output_col,
         )
 
-        return ExecutionResult(
-            success=True,
-            result=result_df,
-            action="yoy_growth",
-        )
+        state.update_df(result_df)
+
+        return ExecutionResult(success=True, state=state)
 
     except ValidationError as e:
         return ExecutionResult(
             success=False,
             error=str(e),
             error_type="ValidationError",
-            action="yoy_growth",
         )
 
 
 def _execute_rolling_average(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[pl.DataFrame, ExecutionResult]:
-    """
-    Execute rolling_average action.
+    state: ExecutionState, step: Dict[str, Any]
+) -> ExecutionResult:
+    """Calculate rolling average."""
 
-    Args:
-        df: Data DataFrame
-        plan: Plan dictionary with 'metric', 'window', and optional 'output_col'
-
-    Returns:
-        DataFrame with rolling average or ExecutionResult with error
-    """
-    metric = plan["metric"]
-    window = int(plan["window"])
-    output_col = plan.get("output_col")
+    metric = step["metric"]
+    window = int(step["window"])
+    output_col = step.get("output_col")
 
     try:
         result_df = rolling_average(
-            df=df,
+            df=state.df,
             value_col=metric,
             window=window,
             output_col=output_col,
         )
 
-        return ExecutionResult(
-            success=True,
-            result=result_df,
-            action="rolling_average",
-        )
+        state.update_df(result_df)
+
+        return ExecutionResult(success=True, state=state)
 
     except ValidationError as e:
         return ExecutionResult(
             success=False,
             error=str(e),
             error_type="ValidationError",
-            action="rolling_average",
         )
 
 
 def _execute_compute_margin(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[pl.DataFrame, ExecutionResult]:
-    """
-    Execute compute_margin action.
+    state: ExecutionState, step: Dict[str, Any]
+) -> ExecutionResult:
+    """Compute margin/ratio."""
 
-    Args:
-        df: Data DataFrame
-        plan: Plan dictionary with 'numerator', 'denominator', 'output_col'
-
-    Returns:
-        DataFrame with margin column or ExecutionResult with error
-    """
     try:
         result_df = compute_margin(
-            df=df,
-            numerator_col=plan["numerator"],
-            denominator_col=plan["denominator"],
-            output_col=plan["output_col"],
+            df=state.df,
+            numerator_col=step["numerator"],
+            denominator_col=step["denominator"],
+            output_col=step["output_col"],
         )
 
-        return ExecutionResult(
-            success=True,
-            result=result_df,
-            action="compute_margin",
-        )
+        state.update_df(result_df)
+
+        return ExecutionResult(success=True, state=state)
 
     except ValidationError as e:
         return ExecutionResult(
             success=False,
             error=str(e),
             error_type="ValidationError",
-            action="compute_margin",
         )
 
 
 def _execute_compute_share(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[pl.DataFrame, ExecutionResult]:
-    """
-    Execute compute_share action.
+    state: ExecutionState, step: Dict[str, Any]
+) -> ExecutionResult:
+    """Compute share/percentage."""
 
-    Args:
-        df: Data DataFrame
-        plan: Plan dictionary with 'value_col', 'total_col', 'output_col'
-
-    Returns:
-        DataFrame with share column or ExecutionResult with error
-    """
     try:
         result_df = compute_share(
-            df=df,
-            value_col=plan["value_col"],
-            total_col=plan["total_col"],
-            output_col=plan["output_col"],
+            df=state.df,
+            value_col=step["value_col"],
+            total_col=step["total_col"],
+            output_col=step["output_col"],
         )
 
-        return ExecutionResult(
-            success=True,
-            result=result_df,
-            action="compute_share",
-        )
+        state.update_df(result_df)
+
+        return ExecutionResult(success=True, state=state)
 
     except ValidationError as e:
         return ExecutionResult(
             success=False,
             error=str(e),
             error_type="ValidationError",
-            action="compute_share",
-        )
-
-
-def _execute_flag_invalid_values(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[pl.DataFrame, ExecutionResult]:
-    """
-    Execute flag_invalid_values action.
-
-    Args:
-        df: Data DataFrame
-        plan: Plan dictionary with 'cols' and optional 'allow_zero'
-
-    Returns:
-        DataFrame with flag columns or ExecutionResult with error
-    """
-    try:
-        result_df = flag_invalid_values(
-            df=df,
-            cols=plan["cols"],
-            allow_zero=plan.get("allow_zero", False),
-        )
-
-        return ExecutionResult(
-            success=True,
-            result=result_df,
-            action="flag_invalid_values",
-        )
-
-    except (ValidationError, ValueError) as e:
-        return ExecutionResult(
-            success=False,
-            error=str(e),
-            error_type=type(e).__name__,
-            action="flag_invalid_values",
-        )
-
-
-def _execute_compute_summary_stats(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[pl.DataFrame, ExecutionResult]:
-    """Execute compute_summary_stats action."""
-    try:
-        result_df = compute_summary_stats(
-            df=df,
-            value_col=plan["metric"],
-            stats=plan.get("stats", ["mean", "median", "std", "min", "max"]),
-        )
-
-        return ExecutionResult(
-            success=True,
-            result=result_df,
-            action="compute_summary_stats",
-        )
-
-    except ValidationError as e:
-        return ExecutionResult(
-            success=False,
-            error=str(e),
-            error_type="ValidationError",
-            action="compute_summary_stats",
-        )
-
-
-def _execute_group_summary_stats(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[pl.DataFrame, ExecutionResult]:
-    """Execute group_summary_stats action."""
-    try:
-        result_df = group_summary_stats(
-            df=df,
-            value_col=plan["metric"],
-            group_col=plan["group_col"],
-            stats=plan.get("stats", ["mean", "median", "count"]),
-        )
-
-        return ExecutionResult(
-            success=True,
-            result=result_df,
-            action="group_summary_stats",
-        )
-
-    except ValidationError as e:
-        return ExecutionResult(
-            success=False,
-            error=str(e),
-            error_type="ValidationError",
-            action="group_summary_stats",
-        )
-
-
-def _execute_select_top_k(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[pl.DataFrame, ExecutionResult]:
-    """Execute select_top_k action."""
-    try:
-        result_df = select_top_k(
-            df=df,
-            metric=plan["metric"],
-            k=plan.get("k", 10),
-            ascending=plan.get("ascending", False),
-        )
-
-        return ExecutionResult(
-            success=True,
-            result=result_df,
-            action="select_top_k",
-        )
-
-    except ValidationError as e:
-        return ExecutionResult(
-            success=False,
-            error=str(e),
-            error_type="ValidationError",
-            action="select_top_k",
-        )
-
-
-def _execute_filter_by_condition(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[pl.DataFrame, ExecutionResult]:
-    """Execute filter_by_condition action."""
-    try:
-        result_df = filter_by_condition(
-            df=df,
-            column=plan["column"],
-            operator=plan["operator"],
-            value=plan["value"],
-        )
-
-        return ExecutionResult(
-            success=True,
-            result=result_df,
-            action="filter_by_condition",
-        )
-
-    except ValidationError as e:
-        return ExecutionResult(
-            success=False,
-            error=str(e),
-            error_type="ValidationError",
-            action="filter_by_condition",
-        )
-
-
-def _execute_aggregate_by_group(
-    df: pl.DataFrame, plan: Dict[str, Any]
-) -> Union[pl.DataFrame, ExecutionResult]:
-    """Execute aggregate_by_group action."""
-    try:
-        result_df = aggregate_by_group(
-            df=df,
-            group_col=plan["group_col"],
-            agg_col=plan["agg_col"],
-            agg_func=plan.get("agg_func", "sum"),
-        )
-
-        return ExecutionResult(
-            success=True,
-            result=result_df,
-            action="aggregate_by_group",
-        )
-
-    except ValidationError as e:
-        return ExecutionResult(
-            success=False,
-            error=str(e),
-            error_type="ValidationError",
-            action="aggregate_by_group",
         )
 
 
 # ============================================================
-# Main Executor
+# Step Executors - Visualization Operations
+# ============================================================
+
+
+def _execute_plot_trend(state: ExecutionState, step: Dict[str, Any]) -> ExecutionResult:
+    """Plot metric trend."""
+
+    metric = step["metric"]
+    company_ids = step.get("company_ids")
+
+    if company_ids:
+        company_ids = [int(c) for c in company_ids]
+
+    try:
+        plottable_metric = find_plottable_metric(
+            state.df,
+            preferred=metric,
+            company_ids=company_ids,
+        )
+
+        fig = plot_metric_trend(
+            df=state.df,
+            metric=plottable_metric,
+            company_ids=company_ids,
+        )
+
+        state.add_visualization(fig, title=f"Trend: {plottable_metric}")
+
+        result = ExecutionResult(success=True, state=state)
+
+        if plottable_metric != metric:
+            result.add_warning(
+                f"Used '{plottable_metric}' instead of '{metric}' (insufficient data)"
+            )
+
+        return result
+
+    except (ValidationError, VisualizationError) as e:
+        return ExecutionResult(
+            success=False,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+
+
+def _execute_compare_companies(
+    state: ExecutionState, step: Dict[str, Any]
+) -> ExecutionResult:
+    """Compare companies."""
+
+    metric = step["metric"]
+    year = int(step["year"])
+    company_ids = step.get("company_ids")
+
+    if company_ids:
+        company_ids = [int(c) for c in company_ids]
+
+    try:
+        plottable_metric = find_plottable_metric(
+            state.df,
+            preferred=metric,
+            company_ids=company_ids,
+            year=year,
+        )
+
+        fig = plot_company_comparison(
+            df=state.df,
+            metric=plottable_metric,
+            year=year,
+            company_ids=company_ids,
+        )
+
+        state.add_visualization(fig, title=f"Comparison: {plottable_metric} ({year})")
+
+        result = ExecutionResult(success=True, state=state)
+
+        if plottable_metric != metric:
+            result.add_warning(
+                f"Used '{plottable_metric}' instead of '{metric}' (insufficient data)"
+            )
+
+        return result
+
+    except (ValidationError, VisualizationError) as e:
+        return ExecutionResult(
+            success=False,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+
+
+def _execute_correlation(
+    state: ExecutionState, step: Dict[str, Any]
+) -> ExecutionResult:
+    """Plot correlation heatmap."""
+
+    requested_metrics = step["metrics"]
+
+    plottable_metrics = [
+        m for m in requested_metrics if is_plottable(state.df, m, min_non_null=3)
+    ]
+
+    if len(plottable_metrics) < 2:
+        return ExecutionResult(
+            success=False,
+            error=f"Need at least 2 plottable metrics. Plottable: {plottable_metrics}",
+            error_type="ValidationError",
+        )
+
+    try:
+        fig = plot_correlation_heatmap(state.df, plottable_metrics)
+
+        state.add_visualization(fig, title="Correlation Matrix")
+
+        result = ExecutionResult(success=True, state=state)
+
+        if len(plottable_metrics) < len(requested_metrics):
+            excluded = set(requested_metrics) - set(plottable_metrics)
+            result.add_warning(f"Excluded metrics: {excluded} (insufficient data)")
+
+        return result
+
+    except (ValidationError, VisualizationError) as e:
+        return ExecutionResult(
+            success=False,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+
+
+# ============================================================
+# Step Executors - Reporting
+# ============================================================
+
+
+def _execute_create_report(
+    state: ExecutionState, step: Dict[str, Any]
+) -> ExecutionResult:
+    """Create comprehensive report."""
+
+    title = step["title"]
+    sections = step.get("sections", ["all"])
+
+    # For now, just compile everything into state metadata
+    state.metadata["report"] = {
+        "title": title,
+        "sections": sections,
+        "summary": state.get_summary(),
+    }
+
+    result = ExecutionResult(success=True, state=state)
+    result.add_warning(
+        f"Report '{title}' compiled with {len(state.visualizations)} visualizations"
+    )
+
+    return result
+
+
+# ============================================================
+# Main Sequential Executor
+# ============================================================
+
+
+STEP_EXECUTORS = {
+    "filter_data": _execute_filter_data,
+    "compute_summary_stats": _execute_compute_summary_stats,
+    "export_table": _execute_export_table,
+    "yoy_growth": _execute_yoy_growth,
+    "rolling_average": _execute_rolling_average,
+    "compute_margin": _execute_compute_margin,
+    "compute_share": _execute_compute_share,
+    "plot_trend": _execute_plot_trend,
+    "compare_companies": _execute_compare_companies,
+    "correlation": _execute_correlation,
+    "create_report": _execute_create_report,
+}
+
+
+def execute_sequential_plan(
+    plan: Dict[str, Any], data_path: str = "data/processed.csv", verbose: bool = True
+) -> ExecutionResult:
+    """
+    Execute a multi-step plan sequentially.
+
+    Each step:
+    1. Executes with current state
+    2. Updates state for next step
+    3. Accumulates results
+
+    Args:
+        plan: Plan dict with "steps" array
+        data_path: Path to initial data
+        verbose: Print progress messages
+
+    Returns:
+        ExecutionResult with final state or error
+    """
+    # Load initial data
+    try:
+        initial_df = load_processed_data(data_path)
+        state = ExecutionState(initial_df)
+    except Exception as e:
+        return ExecutionResult(
+            success=False,
+            error=f"Failed to load data: {e}",
+            error_type="DataLoadError",
+        )
+
+    # Execute steps sequentially
+    steps = plan.get("steps", [])
+
+    if not steps:
+        return ExecutionResult(
+            success=False,
+            error="Plan has no steps",
+            error_type="EmptyPlan",
+        )
+
+    all_warnings = []
+
+    for i, step in enumerate(steps, 1):
+        action = step.get("action")
+
+        if verbose:
+            print(f"  Step {i}/{len(steps)}: {action}...", end=" ")
+
+        if action not in STEP_EXECUTORS:
+            if verbose:
+                print(f"❌")
+            return ExecutionResult(
+                success=False,
+                error=f"Unknown action at step {i}: {action}",
+                error_type="UnknownAction",
+            )
+
+        # Execute step
+        step_result = STEP_EXECUTORS[action](state, step)
+
+        if not step_result.success:
+            if verbose:
+                print(f"❌")
+            return ExecutionResult(
+                success=False,
+                error=f"Step {i} failed: {step_result.error}",
+                error_type=step_result.error_type,
+            )
+
+        # Accumulate warnings
+        all_warnings.extend(step_result.warnings)
+
+        if verbose:
+            print("✓")
+            for warning in step_result.warnings:
+                print(f"    ⚠️  {warning}")
+
+    # Return successful result with final state
+    result = ExecutionResult(
+        success=True,
+        state=state,
+        warnings=all_warnings,
+    )
+
+    return result
+
+
+# ============================================================
+# Backward Compatibility - Single Action Execution
 # ============================================================
 
 
@@ -605,128 +642,14 @@ def execute_plan(
     plan: Dict[str, Any], data_path: str = "data/processed.csv"
 ) -> ExecutionResult:
     """
-    Execute a plan created by the planner.
+    Execute a plan (either single-action or multi-step).
 
-    Args:
-        plan: Plan dictionary with 'action' and parameters
-        data_path: Path to processed data CSV
-
-    Returns:
-        ExecutionResult with success status, result/error, and metadata
+    Detects plan type and routes accordingly.
     """
-    # Load data
-    try:
-        df = _load_data(data_path)
-    except Exception as e:
-        return ExecutionResult(
-            success=False,
-            error=str(e),
-            error_type="DataLoadError",
-            action=plan.get("action"),
-        )
+    # Check if sequential plan
+    if "steps" in plan:
+        return execute_sequential_plan(plan, data_path, verbose=False)
 
-    # Route to appropriate executor
-    action = plan.get("action")
-
-    executors = {
-        "plot_trend": _execute_plot_trend,
-        "compare_companies": _execute_compare_companies,
-        "correlation": _execute_correlation,
-        "yoy_growth": _execute_yoy_growth,
-        "rolling_average": _execute_rolling_average,
-        "compute_margin": _execute_compute_margin,
-        "compute_share": _execute_compute_share,
-        "flag_invalid_values": _execute_flag_invalid_values,
-        "compute_summary_stats": _execute_compute_summary_stats,
-        "group_summary_stats": _execute_group_summary_stats,
-        "select_top_k": _execute_select_top_k,
-        "filter_by_condition": _execute_filter_by_condition,
-        "aggregate_by_group": _execute_aggregate_by_group,
-    }
-
-    if action not in executors:
-        return ExecutionResult(
-            success=False,
-            error=f"Unknown action: {action}",
-            error_type="InvalidAction",
-            action=action,
-        )
-
-    # Execute action
-    try:
-        result = executors[action](df, plan)
-
-        # If executor returns ExecutionResult, return it
-        if isinstance(result, ExecutionResult):
-            return result
-
-        # Otherwise wrap the result
-        return ExecutionResult(
-            success=True,
-            result=result,
-            action=action,
-        )
-
-    except Exception as e:
-        # Catch any unexpected errors
-        return ExecutionResult(
-            success=False,
-            error=f"Unexpected error: {str(e)}",
-            error_type="UnexpectedError",
-            action=action,
-        )
-
-
-# ============================================================
-# Convenience Functions
-# ============================================================
-
-
-def execute_and_display(
-    plan: Dict[str, Any],
-    data_path: str = "data/processed.csv",
-    show_warnings: bool = True,
-) -> Any:
-    """
-    Execute plan and display result with user-friendly messages.
-
-    Args:
-        plan: Plan dictionary
-        data_path: Path to data
-        show_warnings: Whether to print warnings
-
-    Returns:
-        The result (Figure or DataFrame) if successful, None otherwise
-    """
-    result = execute_plan(plan, data_path)
-
-    if result.success:
-        if show_warnings and result.warning:
-            print(f"⚠️  Warning: {result.warning}")
-
-        if result.fallback_used and show_warnings:
-            print("ℹ️  Note: Fallback metric was used due to insufficient data")
-
-        return result.result
-
-    else:
-        print(f"❌ Execution failed ({result.error_type})")
-        print(f"   {result.error}")
-        return None
-
-
-def get_execution_summary(result: ExecutionResult) -> Dict[str, Any]:
-    """
-    Get a summary dictionary of execution result.
-
-    Useful for logging or API responses.
-    """
-    return {
-        "success": result.success,
-        "action": result.action,
-        "error_type": result.error_type,
-        "error_message": result.error,
-        "fallback_used": result.fallback_used,
-        "warning": result.warning,
-        "has_result": result.result is not None,
-    }
+    # Single action - wrap in steps array
+    wrapped_plan = {"steps": [plan]}
+    return execute_sequential_plan(wrapped_plan, data_path, verbose=False)

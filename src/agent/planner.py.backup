@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 
 import ollama
 
-from src.tools.tool_mapping import TOOL_REGISTRY, ToolCategory
+from tools.tool_mapping import TOOL_REGISTRY, ToolCategory
 
 # ============================================================
 # Available Metrics

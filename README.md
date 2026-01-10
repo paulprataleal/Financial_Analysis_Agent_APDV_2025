@@ -2,6 +2,232 @@
 
 ## TO CHANGE
 
+# Sequential Financial Analysis Agent - Usage Guide
+
+## 🎯 What Changed?
+
+### Previous Architecture (Single Action)
+```
+User Query → Planner → Single Action → Executor → Result
+```
+
+### New Architecture (Sequential)
+```
+User Query → Planner → Multi-Step Plan → Sequential Executor → Results
+                                              ↓
+                                    State flows between steps
+                                    (DataFrame, visualizations, tables)
+```
+
+## 📋 Architecture Overview
+
+### 1. **Planner** (`agent/planner.py`)
+**Changed**: Now outputs `{"steps": [...]}` instead of single action
+
+- Creates multi-step execution plans
+- Each step can use outputs from previous steps
+- Validates all steps upfront
+- Supports 11 different action types
+
+### 2. **Executor** (`agent/executor.py`)
+**Changed**: Now maintains state across steps
+
+- `ExecutionState` class tracks:
+  - Current DataFrame (modified by each step)
+  - Generated visualizations
+  - Summary tables
+  - Exported files
+  
+- Executes steps sequentially
+- Each step updates state for next step
+- Comprehensive error handling per step
+
+### 3. **Orchestrator** (`agent/orchestrator.py`)
+**Changed**: Now coordinates multi-step execution
+
+- Manages the complete pipeline
+- Displays results progressively
+- Tracks execution history
+- Provides usage statistics
+
+## 🚀 Usage Examples
+
+### Example 1: Simple Sequential Workflow
+```python
+from agent.orchestrator import quick_query
+
+state = quick_query(
+    "Filter to companies 1-5, calculate profit margins, and plot the trend"
+)
+
+# Behind the scenes, this creates a plan like:
+{
+  "steps": [
+    {
+      "action": "filter_data",
+      "conditions": [{"column": "company_id", "operator": "in", "value": [1,2,3,4,5]}]
+    },
+    {
+      "action": "compute_margin",
+      "numerator": "net_income",
+      "denominator": "revenue",
+      "output_col": "profit_margin"
+    },
+    {
+      "action": "plot_trend",
+      "metric": "profit_margin"
+    }
+  ]
+}
+```
+
+### Example 2: Data Analysis Pipeline
+```python
+state = quick_query(
+    "Filter to 2023, show summary statistics for revenue and assets, "
+    "then export to CSV"
+)
+
+# Access results:
+print(f"Tables generated: {len(state.tables)}")
+print(f"Files exported: {state.exports}")
+```
+
+### Example 3: Complex Multi-Step Analysis
+```python
+from agent.orchestrator import FinancialAnalysisAgent
+
+agent = FinancialAnalysisAgent()
+
+state = agent.query(
+    "Filter to years 2020-2023, compute ROE for each company, "
+    "calculate 3-year rolling averages, plot the trends, "
+    "show correlation with revenue, and create a comprehensive report"
+)
+
+# The planner will create ~5-6 steps
+# The executor will run them sequentially
+# Results accumulate in the state
+```
+
+### Example 4: Batch Processing
+```python
+agent = FinancialAnalysisAgent()
+
+queries = [
+    "Compare revenue across companies in 2023",
+    "Calculate profit margins and show trends",
+    "Export top 10 companies by ROE to Excel"
+]
+
+results = agent.batch_query(queries)
+
+# Show statistics
+agent.show_statistics()
+```
+
+### Example 5: Interactive Mode
+```python
+from agent.orchestrator import interactive_mode
+
+interactive_mode()
+
+# Then type queries like:
+# "Filter to tech companies and plot revenue trends"
+# "Calculate YoY growth and export to CSV"
+# "stats" - to see usage
+# "quit" - to exit
+```
+
+## 🔧 Available Actions (11 Total)
+
+### Data Operations
+1. **filter_data** - Subset data by conditions
+2. **compute_summary_stats** - Calculate mean, median, std, etc.
+3. **export_table** - Save to CSV/Excel
+
+### Analysis Operations
+4. **yoy_growth** - Year-over-year growth rates
+5. **rolling_average** - Moving averages
+6. **compute_margin** - Ratios between metrics
+7. **compute_share** - Percentage calculations
+
+### Visualization Operations
+8. **plot_trend** - Time series line charts
+9. **compare_companies** - Cross-sectional bar charts
+10. **correlation** - Correlation heatmaps
+
+### Reporting
+11. **create_report** - Compile all results
+
+## 📊 State Management
+
+### ExecutionState Class
+```python
+class ExecutionState:
+    df: pl.DataFrame              # Current working data
+    visualizations: List[Figure]  # Generated plots
+    tables: List[Dict]            # Summary tables
+    exports: List[str]            # Exported file paths
+    metadata: Dict                # Additional info
+```
+
+### How State Flows
+```
+Step 1: filter_data
+  Input: Original DataFrame
+  Output: Filtered DataFrame
+  State: df updated
+
+Step 2: compute_margin
+  Input: Filtered DataFrame
+  Output: DataFrame + new margin column
+  State: df updated
+
+Step 3: plot_trend
+  Input: DataFrame with margin column
+  Output: Plotly Figure
+  State: visualization added
+
+Step 4: export_table
+  Input: Current DataFrame
+  Output: CSV file
+  State: export path added
+```
+
+## 🎨 Example Workflows
+
+### Workflow 1: Financial Ratio Analysis
+```
+User: "Calculate profit margins for 2023 and compare top 5 companies"
+
+Plan:
+1. filter_data (year == 2023)
+2. compute_margin (net_income / revenue)
+3. filter_data (top 5 by margin)
+4. compare_companies (profit_margin, 2023)
+```
+
+### Workflow 2: Time Series Analysis
+```
+User: "Show 3-year moving average of revenue for companies 1-10"
+
+Plan:
+1. filter_data (company_id in [1...10])
+2. rolling_average (revenue, window=3)
+3. plot_trend (revenue_rolling_3)
+```
+
+### Workflow 3: Comprehensive Report
+```
+User: "Filter to 2020-2023, compute ROE, show stats and trends, export everything"
+
+Plan:
+1. filter_data (2020 <= year <= 2023)
+2. compute_margin (net_income / equity → ROE)
+3. compute_summary_stats (ROE, group_by=year
+
+
 AI-powered financial data analysis agent using Mistral LLM via Ollama. Query financial data using natural language and get comprehensive analysis with visualizations.
 
 ## Features
